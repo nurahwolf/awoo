@@ -363,6 +363,10 @@ fn main() -> Result<()> {
                     }
                     return true;
                 }
+
+                // This was a collision, so increment the collision counter.
+                cons_count.fetch_add(1, Ordering::Relaxed);
+
                 copy_file(entry, &dst_base, args.dry_run, args.debug, &copy_pb)
                     .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                     .is_ok()
