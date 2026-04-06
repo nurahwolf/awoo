@@ -364,21 +364,39 @@ fn main() -> Result<()> {
                     return true;
                 }
 
-                // This was a collision, so increment the collision counter.
-                cons_count.fetch_add(1, Ordering::Relaxed);
-
                 copy_file(entry, &dst_base, args.dry_run, args.debug, &copy_pb)
                     .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                     .is_ok()
             })
         };
 
-        // Update counters (mirrors original db-scan logic, but without allocation).
-        if all_same {
-            cons_count.fetch_add(1, Ordering::Relaxed);
-        } else {
-            coll_count.fetch_add(entries.len(), Ordering::Relaxed);
+        enum Outcome {
+            Consolidated,
+            Collision(usize),  // number of files routed to collision
+            Skipped,
         }
+
+        let outcome = if all_same {
+            let dst = args.consolidated.join(rel_path.as_ref());
+            if dst.exists() {
+                match hash_file_cached(&dst, &state) {
+                    Ok(existing_hash) if existing_hash == first_hash => Outcome::Consolidated,
+                    Ok(_) => Outcome::Collision(entries.len()),  // Conflict with existing file
+                    Err(_) => Outcome::Skipped,
+                }
+            } else {
+                Outcome::Consolidated
+            }
+        } else {
+            Outcome::Collision(entries.len())  // Hash mismatch among sources
+        };
+
+        // Update counters based on actual outcome
+        match outcome {
+            Outcome::Consolidated => cons_count.fetch_add(1, Ordering::Relaxed),
+            Outcome::Collision(n) => coll_count.fetch_add(n, Ordering::Relaxed),
+            Outcome::Skipped => 0
+        };
 
         if success && !args.dry_run {
             // Update in-memory completed set (brief write lock).
