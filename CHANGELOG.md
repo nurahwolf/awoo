@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.4] - Overwrite Protection & Code Refactor
+
+### Fixed
+- Copying a new source into an already-populated `Consolidated` directory no longer overwrites existing files.
+  - If the destination exists with **identical** content (same BLAKE3 hash), the file is silently skipped.
+  - If the destination exists with **different** content, the incoming file is routed to `Collision` and a warning is emitted, leaving the existing consolidated file untouched.
+- Files already present in `Collision` from a previous run are now skipped rather than overwritten.
+
+### Changed
+- `src/main.rs` has been split into four focused modules for maintainability:
+  - `args.rs` — CLI argument definition (`Args`)
+  - `progress.rs` — progress state, hash cache, and serialisation (`ProgressState`, `HashCacheEntry`, `SAVE_INTERVAL`)
+  - `hasher.rs` — BLAKE3 hashing with cache (`hash_file`, `hash_file_cached`)
+  - `fs.rs` — all filesystem operations (`FileEntry`, `copy_file`, `create_subvol_or_dir`, reflink logic)
+
 ## [0.0.3] - BTRFS Subvolume Output
 
 ### Added
