@@ -1,0 +1,13 @@
+[package]
+edition = "2021"
+name = "awoo"
+version = "0.2.0"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1.5"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17
+jwalk = "0.8"
+libc = "0.2"
+rayon = "1.10"
