@@ -6,7 +6,7 @@ version = "0.2.0"
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
 anyhow = "1"
-blake3 = "1.5"
+blake3 = { version = "1.5", features = ["rayon"] }
 clap = { version = "4", features = ["derive"] }
 filetime = "0.2"
 indicatif = "0.17"
