@@ -30,4 +30,8 @@ pub struct Args {
     /// Path to the progress/cache file (default: <consolidated>/.awoo_progress.json)
     #[arg(long)]
     pub progress_file: Option<PathBuf>,
+
+    /// Print filesystem, I/O capability, and copy-strategy diagnostics then continue.
+    #[arg(long)]
+    pub debug: bool,
 }

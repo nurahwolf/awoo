@@ -1,4 +1,5 @@
 mod args;
+mod debug;
 mod fs;
 mod hasher;
 mod progress;
@@ -124,6 +125,10 @@ fn main() -> Result<()> {
     if !args.dry_run {
         create_subvol_or_dir(&args.consolidated).context("Failed to create consolidated dir")?;
         create_subvol_or_dir(&args.collision).context("Failed to create collision dir")?;
+    }
+
+    if args.debug {
+        debug::print_debug_info(&args, &sources, &progress_file);
     }
 
     // ─────────────────────────────────────────────────────────────
