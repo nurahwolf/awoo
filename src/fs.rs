@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use indicatif::ProgressBar;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -156,19 +157,20 @@ fn copy_metadata(src: &Path, dst: &Path) -> Result<()> {
 /// Direct I/O copy, then renames into place.
 ///
 /// When `debug` is true, prints a one-line label for each file showing which
-/// copy method was actually used: `[FICLONE ]`, `[O_DIRECT]`, or `[CP      ]`.
+/// copy method was actually used. Output is routed through `pb.println` so it
+/// renders cleanly above the active progress bar rather than corrupting it.
 ///
 /// - FICLONE path: already atomic and preserves all metadata natively.
 /// - Fallback path: `copy_content` (O_DIRECT read + cache eviction) followed
 ///   by `copy_metadata` (xattrs, ownership, timestamps), then an atomic rename.
 ///   A crash or disk-full mid-write leaves `dst` untouched.
-fn copy_with_reflink_fallback(src: &Path, dst: &Path, debug: bool) -> Result<()> {
+fn copy_with_reflink_fallback(src: &Path, dst: &Path, debug: bool, pb: &ProgressBar) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         // FICLONE is already atomic and preserves all metadata — nothing else needed.
         if reflink_file(src, dst).is_ok() {
             if debug {
-                eprintln!("[FICLONE ] {}", dst.display());
+                pb.println(format!("[FICLONE ] {}", dst.display()));
             }
             return Ok(());
         }
@@ -193,9 +195,9 @@ fn copy_with_reflink_fallback(src: &Path, dst: &Path, debug: bool) -> Result<()>
         Ok(used_direct) => {
             if debug {
                 if used_direct {
-                    eprintln!("[O_DIRECT] {}", dst.display());
+                    pb.println(format!("[O_DIRECT] {}", dst.display()));
                 } else {
-                    eprintln!("[CP      ] {}", dst.display());
+                    pb.println(format!("[CP      ] {}", dst.display()));
                 }
             }
             Ok(())
@@ -290,17 +292,23 @@ pub fn create_subvol_or_dir(path: &Path) -> Result<()> {
 
 /// Copy a `FileEntry` to `dst_base/entry.rel_path`, using a Btrfs reflink where possible.
 ///
-/// In dry-run mode, prints what would be copied instead of performing the operation.
-/// When `debug` is true, prints a one-line label showing the copy method used.
-pub fn copy_file(entry: &FileEntry, dst_base: &Path, dry_run: bool, debug: bool) -> Result<()> {
+/// All terminal output (dry-run notices and debug copy-method labels) is routed
+/// through `pb.println` so it prints cleanly above the active progress bar.
+pub fn copy_file(
+    entry: &FileEntry,
+    dst_base: &Path,
+    dry_run: bool,
+    debug: bool,
+    pb: &ProgressBar,
+) -> Result<()> {
     let dst = dst_base.join(&entry.rel_path);
 
     if dry_run {
-        eprintln!(
+        pb.println(format!(
             "[DRY    ] {} -> {}",
             entry.abs_path.display(),
             dst.display()
-        );
+        ));
         return Ok(());
     }
 
@@ -309,6 +317,6 @@ pub fn copy_file(entry: &FileEntry, dst_base: &Path, dry_run: bool, debug: bool)
             .with_context(|| format!("Failed to create directory {:?}", parent))?;
     }
 
-    copy_with_reflink_fallback(&entry.abs_path, &dst, debug)?;
+    copy_with_reflink_fallback(&entry.abs_path, &dst, debug, pb)?;
     Ok(())
 }

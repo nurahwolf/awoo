@@ -253,7 +253,7 @@ fn main() -> Result<()> {
                     Ok(existing_hash) if existing_hash == entries[0].hash => {
                         // Identical content already in place — nothing to do
                         if args.debug {
-                            eprintln!("[SKIP    ] {} (identical content already in Consolidated)", rel_path.display());
+                            copy_pb.println(format!("[SKIP    ] {} (identical content already in Consolidated)", rel_path.display()));
                         }
                         true
                     }
@@ -266,7 +266,7 @@ fn main() -> Result<()> {
                         );
                         entries.iter().all(|entry| {
                             let dst_base = args.collision.join(&entry.source_name);
-                            copy_file(entry, &dst_base, args.dry_run, args.debug)
+                            copy_file(entry, &dst_base, args.dry_run, args.debug, &copy_pb)
                                 .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                                 .is_ok()
                         })
@@ -281,7 +281,7 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                copy_file(&entries[0], &args.consolidated, args.dry_run, args.debug)
+                copy_file(&entries[0], &args.consolidated, args.dry_run, args.debug, &copy_pb)
                     .map_err(|e| eprintln!("⚠️  Consolidate failed: {}", e))
                     .is_ok()
             }
@@ -292,11 +292,11 @@ fn main() -> Result<()> {
                 if collision_dst.exists() {
                     // Already written to Collision in a previous run — skip
                     if args.debug {
-                        eprintln!("[SKIP    ] {} (already in Collision)", collision_dst.display());
+                        copy_pb.println(format!("[SKIP    ] {} (already in Collision)", collision_dst.display()));
                     }
                     return true;
                 }
-                copy_file(entry, &dst_base, args.dry_run, args.debug)
+                copy_file(entry, &dst_base, args.dry_run, args.debug, &copy_pb)
                     .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                     .is_ok()
             })
