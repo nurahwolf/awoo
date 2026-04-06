@@ -45,10 +45,14 @@ fn reflink_file(src: &Path, dst: &Path) -> Result<()> {
 
 /// Cross-platform wrapper: tries reflink on Linux, falls back to an atomic std::fs::copy.
 ///
-/// The fallback writes to a hidden `.awoo_tmp` file in the same directory, preserves
-/// the source's timestamps, then renames atomically into place. This ensures a
-/// partially-written file (e.g. from disk-full or SIGKILL) is never mistaken for a
-/// valid destination on the next run.
+/// The fallback writes to a hidden `.awoo_tmp` file in the same directory, then
+/// copies extended attributes, ownership (uid/gid), and timestamps from the source
+/// before renaming atomically into place. This ensures a partially-written file
+/// (e.g. from disk-full or SIGKILL) is never mistaken for a valid destination on
+/// the next run, and that all metadata is faithfully preserved.
+///
+/// All metadata steps are best-effort — errors are silently ignored for filesystems
+/// or permission levels that don't support them.
 fn copy_with_reflink_fallback(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -70,7 +74,27 @@ fn copy_with_reflink_fallback(src: &Path, dst: &Path) -> Result<()> {
         std::fs::copy(src, &tmp)
             .with_context(|| format!("Failed to copy {:?} to {:?}", src, &tmp))?;
 
-        // Preserve source timestamps (best-effort — ignore errors on unsupported fs).
+        // Preserve extended attributes — covers user xattrs, POSIX ACLs, SELinux
+        // labels, and any other xattr namespace supported by the filesystem.
+        #[cfg(unix)]
+        if let Ok(names) = xattr::list(src) {
+            for name in names {
+                if let Ok(Some(value)) = xattr::get(src, &name) {
+                    let _ = xattr::set(&tmp, &name, &value);
+                }
+            }
+        }
+
+        // Preserve ownership (uid/gid) — best-effort; requires CAP_CHOWN or root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(src) {
+                let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
+            }
+        }
+
+        // Preserve timestamps — must come after chown, as chown can reset atime.
         if let Ok(meta) = std::fs::metadata(src) {
             let atime = filetime::FileTime::from_last_access_time(&meta);
             let mtime = filetime::FileTime::from_last_modification_time(&meta);
