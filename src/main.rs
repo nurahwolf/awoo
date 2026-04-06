@@ -4,20 +4,21 @@ mod fs;
 mod hasher;
 mod progress;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::{Parallelism, WalkDir};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use args::Args;
 use fs::{copy_file, create_subvol_or_dir, FileEntry};
 use hasher::hash_file_cached;
-use progress::{ckpt_path, ProgressState, SAVE_INTERVAL};
+use progress::{ckpt_path, ProgressState};
 
 /// Returns a best-effort absolute path. Tries `canonicalize` first (resolves symlinks);
 /// falls back to prepending the current working directory for paths that don't exist yet.
@@ -41,6 +42,16 @@ fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Configure the Rayon thread pool before any parallel work begins.
+    // Over-subscribing (e.g. --threads 2× CPU count) keeps storage saturated
+    // while some threads are waiting on I/O.
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .context("Failed to configure Rayon thread pool")?;
+    }
 
     // Determine progress file path
     let progress_file = args
@@ -69,7 +80,7 @@ fn main() -> Result<()> {
             // Fresh run: keep hash cache for speed but reset completion records
             s.completed.clear();
         }
-        Arc::new(Mutex::new(s))
+        Arc::new(RwLock::new(s))
     };
 
     // Parse & canonicalize sources
@@ -82,10 +93,9 @@ fn main() -> Result<()> {
     }
 
     // ── Startup validation ────────────────────────────────────────
-    // 1. Duplicate source names — collision files are bucketed by name,
-    //    so two sources sharing a name would silently overwrite each other.
+    // 1. Duplicate source names
     {
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
         for (name, _) in &sources {
             if !seen.insert(name.as_str()) {
                 anyhow::bail!(
@@ -94,9 +104,7 @@ fn main() -> Result<()> {
             }
         }
     }
-
-    // 2. Source / output overlap — scanning a path that contains (or is contained
-    //    by) an output directory corrupts the run.
+    // 2. Source / output overlap
     {
         let cons_abs = resolve_path(&args.consolidated);
         let coll_abs = resolve_path(&args.collision);
@@ -106,7 +114,6 @@ fn main() -> Result<()> {
                 "Consolidated ({cons_abs:?}) and Collision ({coll_abs:?}) directories overlap."
             );
         }
-
         for (name, src) in &sources {
             if paths_overlap(src, &cons_abs) {
                 anyhow::bail!(
@@ -135,13 +142,18 @@ fn main() -> Result<()> {
     // Phase 1: Parallel Scan
     // ─────────────────────────────────────────────────────────────
     let scan_pb = ProgressBar::new_spinner();
+    scan_pb.enable_steady_tick(Duration::from_millis(100));
     scan_pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
     scan_pb.set_message("🔍 Scanning filesystem in parallel...");
 
-    let all_paths: Vec<(String, PathBuf, PathBuf)> = sources
+    // Use Arc<str> for source names — Arc::clone is a cheap atomic increment
+    // rather than a heap allocation, saving ~1 alloc per file per source.
+    // Use Arc<PathBuf> for rel paths so the same allocation is shared between
+    // all_paths, FileEntry, and the db HashMap key (no PathBuf clone per entry).
+    let all_paths: Vec<(Arc<str>, PathBuf, Arc<PathBuf>)> = sources
         .iter()
         .flat_map(|(name, src)| {
-            let name_clone = name.clone();
+            let name_arc: Arc<str> = Arc::from(name.as_str());
             let src_clone = src.clone();
             WalkDir::new(&src_clone)
                 .parallelism(Parallelism::RayonDefaultPool {
@@ -158,8 +170,9 @@ fn main() -> Result<()> {
                     if !ft.is_file() {
                         return None;
                     }
-                    let rel = entry.path().strip_prefix(&src_clone).unwrap().to_path_buf();
-                    Some((name_clone.clone(), entry.path().to_path_buf(), rel))
+                    let rel =
+                        Arc::new(entry.path().strip_prefix(&src_clone).unwrap().to_path_buf());
+                    Some((Arc::clone(&name_arc), entry.path().to_path_buf(), rel))
                 })
         })
         .collect();
@@ -175,6 +188,7 @@ fn main() -> Result<()> {
     // Phase 2: Parallel Hashing (with cache + resume skip)
     // ─────────────────────────────────────────────────────────────
     let hash_pb = ProgressBar::new(all_paths.len() as u64);
+    hash_pb.enable_steady_tick(Duration::from_millis(100));
     hash_pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.blue} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
@@ -186,10 +200,11 @@ fn main() -> Result<()> {
     let all_entries: Vec<FileEntry> = all_paths
         .par_iter()
         .filter_map(|(name, abs, rel)| {
-            // In resume mode, skip files whose rel_path was already completed
+            // In resume mode, skip files whose rel_path was already completed.
+            // RwLock read — multiple threads can check simultaneously.
             if args.resume {
                 let rel_str = rel.to_string_lossy().to_string();
-                if state.lock().unwrap().completed.contains(&rel_str) {
+                if state.read().unwrap().completed.contains(&rel_str) {
                     hash_pb.inc(1);
                     return None;
                 }
@@ -199,9 +214,9 @@ fn main() -> Result<()> {
                 Ok(hash) => {
                     hash_pb.inc(1);
                     Some(FileEntry {
-                        source_name: name.clone(),
+                        source_name: Arc::clone(name),
                         abs_path: abs.clone(),
-                        rel_path: rel.clone(),
+                        rel_path: Arc::clone(rel),
                         hash,
                     })
                 }
@@ -217,9 +232,10 @@ fn main() -> Result<()> {
     hash_pb.finish_and_clear();
     eprintln!("✅ Hashed {} files successfully.\n", all_entries.len());
 
-    // Persist hash cache after hashing phase
+    // Persist hash cache after hashing phase.
+    // read() is sufficient — save() takes &self.
     if !args.dry_run {
-        if let Err(e) = state.lock().unwrap().save(&progress_file) {
+        if let Err(e) = state.read().unwrap().save(&progress_file) {
             eprintln!("⚠️  Failed to save hash cache: {}", e);
         }
     }
@@ -227,12 +243,16 @@ fn main() -> Result<()> {
     // ─────────────────────────────────────────────────────────────
     // Phase 3: Group & Parallel Copy/Reflink
     // ─────────────────────────────────────────────────────────────
-    let mut db: HashMap<PathBuf, Vec<FileEntry>> = HashMap::new();
+    // Arc::clone on rel_path shares the existing PathBuf allocation as the
+    // HashMap key — no extra heap alloc per entry.
+    let mut db: AHashMap<Arc<PathBuf>, Vec<FileEntry>> = AHashMap::with_capacity(all_entries.len());
     for entry in all_entries {
-        db.entry(entry.rel_path.clone()).or_default().push(entry);
+        let key = Arc::clone(&entry.rel_path);
+        db.entry(key).or_default().push(entry);
     }
 
     let copy_pb = ProgressBar::new(db.len() as u64);
+    copy_pb.enable_steady_tick(Duration::from_millis(100));
     copy_pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.blue} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
@@ -241,31 +261,55 @@ fn main() -> Result<()> {
     );
     copy_pb.set_message("📦 Copying & deduplicating...");
 
+    // Open the append-only checkpoint log before starting the copy phase.
+    // Each successful completion appends a single line (~60 bytes).
+    // No more serialising the entire hash cache on every N-th file.
+    let ckpt_writer: Option<Arc<std::sync::Mutex<std::fs::File>>> = if !args.dry_run {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(ckpt_path(&progress_file))
+            .context("Failed to open checkpoint log")?;
+        Some(Arc::new(std::sync::Mutex::new(f)))
+    } else {
+        None
+    };
+
+    // Atomic counters — updated without a lock on every file.
+    let cons_count = AtomicUsize::new(0);
+    let coll_count = AtomicUsize::new(0);
+
     db.par_iter().for_each(|(rel_path, entries)| {
         let rel_str = rel_path.to_string_lossy().to_string();
-        let unique_hashes: HashSet<[u8; 32]> = entries.iter().map(|e| e.hash).collect();
 
-        let success = if unique_hashes.len() == 1 {
-            let dst = args.consolidated.join(rel_path);
+        // Allocation-free uniqueness check: compare every hash to the first.
+        // Replaces the previous HashSet<[u8; 32]> creation per group.
+        let first_hash = entries[0].hash;
+        let all_same = entries.iter().all(|e| e.hash == first_hash);
+
+        let success = if all_same {
+            let dst = args.consolidated.join(rel_path.as_ref());
             if dst.exists() {
-                // Destination already in Consolidated — check whether it is the same content
+                // Destination already in Consolidated — check content.
                 match hash_file_cached(&dst, &state) {
-                    Ok(existing_hash) if existing_hash == entries[0].hash => {
-                        // Identical content already in place — nothing to do
+                    Ok(existing_hash) if existing_hash == first_hash => {
+                        // Identical content already in place — nothing to do.
                         if args.debug {
-                            copy_pb.println(format!("[SKIP    ] {} (identical content already in Consolidated)", rel_path.display()));
+                            copy_pb.println(format!(
+                                "[SKIP    ] {} (identical content already in Consolidated)",
+                                rel_path.display()
+                            ));
                         }
                         true
                     }
                     Ok(_) => {
-                        // Different content — conflict with an existing consolidated file;
-                        // route the incoming file(s) to Collision and leave the existing one alone
+                        // Different content — conflict; route to Collision.
                         eprintln!(
                             "⚠️  Conflict: {} already exists with different content. Routing to Collision.",
                             dst.display()
                         );
                         entries.iter().all(|entry| {
-                            let dst_base = args.collision.join(&entry.source_name);
+                            let dst_base = args.collision.join(entry.source_name.as_ref());
                             copy_file(entry, &dst_base, args.dry_run, args.debug, &copy_pb)
                                 .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                                 .is_ok()
@@ -287,12 +331,14 @@ fn main() -> Result<()> {
             }
         } else {
             entries.iter().all(|entry| {
-                let dst_base = args.collision.join(&entry.source_name);
-                let collision_dst = dst_base.join(&entry.rel_path);
+                let dst_base = args.collision.join(entry.source_name.as_ref());
+                let collision_dst = dst_base.join(entry.rel_path.as_ref());
                 if collision_dst.exists() {
-                    // Already written to Collision in a previous run — skip
                     if args.debug {
-                        copy_pb.println(format!("[SKIP    ] {} (already in Collision)", collision_dst.display()));
+                        copy_pb.println(format!(
+                            "[SKIP    ] {} (already in Collision)",
+                            collision_dst.display()
+                        ));
                     }
                     return true;
                 }
@@ -302,20 +348,21 @@ fn main() -> Result<()> {
             })
         };
 
+        // Update counters (mirrors original db-scan logic, but without allocation).
+        if all_same {
+            cons_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            coll_count.fetch_add(entries.len(), Ordering::Relaxed);
+        }
+
         if success && !args.dry_run {
-            let should_save = {
-                let mut s = state.lock().unwrap();
-                s.completed.insert(rel_str);
-                s.completed.len() % SAVE_INTERVAL == 0
-            };
-            if should_save {
-                // Use save_completions (omits the hash cache) rather than save().
-                // The hash cache does not change during Phase 3 and can be 200 MB+
-                // for large datasets; calling save() here serialised the entire
-                // Rayon thread pool through a multi-second mutex hold every 500 files.
-                if let Err(e) = state.lock().unwrap().save_completions(&progress_file) {
-                    eprintln!("⚠️  Failed to save progress checkpoint: {}", e);
-                }
+            // Update in-memory completed set (brief write lock).
+            state.write().unwrap().completed.insert(rel_str.clone());
+
+            // Append to the checkpoint log — one tiny write, no full serialisation.
+            if let Some(ref writer) = ckpt_writer {
+                use std::io::Write;
+                let _ = writeln!(writer.lock().unwrap(), "{}", rel_str);
             }
         }
 
@@ -324,38 +371,31 @@ fn main() -> Result<()> {
 
     copy_pb.finish_and_clear();
 
-    // Final full save — includes both the completed set and the hash cache.
-    // Once this succeeds the lightweight .ckpt file (written during Phase 3
-    // checkpoints) is no longer needed and is removed.
+    // Close the checkpoint log before the final full save.
+    drop(ckpt_writer);
+
+    // Final full save — persists hash cache + completed set.
+    // Deletes the checkpoint log on success (it is now redundant).
     if !args.dry_run {
-        if let Err(e) = state.lock().unwrap().save(&progress_file) {
+        if let Err(e) = state.read().unwrap().save(&progress_file) {
             eprintln!("⚠️  Failed to save final progress: {}", e);
         } else {
-            // Best-effort: clean up the checkpoint file now that the full
-            // state has been atomically committed to the main progress file.
             let _ = std::fs::remove_file(ckpt_path(&progress_file));
         }
     }
 
     // Summary
-    let cons_count = db
-        .iter()
-        .filter(|(_, v)| v.iter().map(|e| e.hash).collect::<HashSet<_>>().len() == 1)
-        .count();
-    let coll_count = db
-        .iter()
-        .filter(|(_, v)| v.iter().map(|e| e.hash).collect::<HashSet<_>>().len() > 1)
-        .map(|(_, v)| v.len())
-        .sum::<usize>();
-    let total_completed = state.lock().unwrap().completed.len();
+    let cons = cons_count.load(Ordering::Relaxed);
+    let coll = coll_count.load(Ordering::Relaxed);
+    let total_completed = state.read().unwrap().completed.len();
 
     eprintln!("\n🏁 Done!");
-    eprintln!("  📂 Consolidated: {} unique paths", cons_count);
-    eprintln!("  💥 Collisions:   {} files", coll_count);
-    if args.resume && total_completed > cons_count + coll_count {
+    eprintln!("  📂 Consolidated: {} unique paths", cons);
+    eprintln!("  💥 Collisions:   {} files", coll);
+    if args.resume && total_completed > cons + coll {
         eprintln!(
             "  ⏭️  Skipped (already done): {} paths",
-            total_completed.saturating_sub(cons_count + coll_count)
+            total_completed.saturating_sub(cons + coll)
         );
     }
     eprintln!("  📊 Total completed: {} paths", total_completed);

@@ -34,4 +34,10 @@ pub struct Args {
     /// Print filesystem, I/O capability, and copy-strategy diagnostics then continue.
     #[arg(long)]
     pub debug: bool,
+
+    /// Number of Rayon worker threads (default: logical CPU count).
+    /// Over-subscribing (e.g. 2× CPU count) can improve throughput for
+    /// I/O-heavy workloads by keeping storage busy while some threads wait.
+    #[arg(long)]
+    pub threads: Option<usize>,
 }

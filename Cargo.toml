@@ -4,6 +4,7 @@ name = "awoo"
 version = "0.2.0"
 
 [dependencies]
+ahash = { version = "0.8", features = ["serde"] }
 anyhow = "1"
 blake3 = "1.5"
 clap = { version = "4", features = ["derive"] }
@@ -11,6 +12,7 @@ filetime = "0.2"
 indicatif = "0.17"
 jwalk = "0.8"
 libc = "0.2"
+memmap2 = "0.9"
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,14 +1,29 @@
+use ahash::AHashSet;
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
+use std::cell::RefCell;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+/// A file discovered during the scan phase and ready to be hashed / copied.
+///
+/// `source_name` and `rel_path` are wrapped in `Arc` so that the same
+/// allocation is shared between `all_paths`, every `FileEntry`, and the
+/// `db` HashMap key — avoiding one heap allocation per file for each.
 pub struct FileEntry {
-    pub source_name: String,
+    pub source_name: Arc<str>,
     pub abs_path: PathBuf,
-    pub rel_path: PathBuf,
+    pub rel_path: Arc<PathBuf>,
     pub hash: [u8; 32],
+}
+
+// Thread-local set of directories already created in this Rayon worker.
+// Avoids calling create_dir_all (which stats every path component) for
+// files that share a parent directory, which is very common in large trees.
+thread_local! {
+    static KNOWN_DIRS: RefCell<AHashSet<PathBuf>> = RefCell::new(AHashSet::new());
 }
 
 /// Copy file using native Btrfs FICLONE ioctl (Linux only).
@@ -294,6 +309,10 @@ pub fn create_subvol_or_dir(path: &Path) -> Result<()> {
 ///
 /// All terminal output (dry-run notices and debug copy-method labels) is routed
 /// through `pb.println` so it prints cleanly above the active progress bar.
+///
+/// Parent directory creation is short-circuited via a thread-local cache of
+/// directories already created by this Rayon worker, avoiding redundant
+/// `stat` syscalls for files that share a parent.
 pub fn copy_file(
     entry: &FileEntry,
     dst_base: &Path,
@@ -301,7 +320,7 @@ pub fn copy_file(
     debug: bool,
     pb: &ProgressBar,
 ) -> Result<()> {
-    let dst = dst_base.join(&entry.rel_path);
+    let dst = dst_base.join(entry.rel_path.as_ref());
 
     if dry_run {
         pb.println(format!(
@@ -313,8 +332,12 @@ pub fn copy_file(
     }
 
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {:?}", parent))?;
+        let already_known = KNOWN_DIRS.with(|dirs| dirs.borrow().contains(parent));
+        if !already_known {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {:?}", parent))?;
+            KNOWN_DIRS.with(|dirs| dirs.borrow_mut().insert(parent.to_path_buf()));
+        }
     }
 
     copy_with_reflink_fallback(&entry.abs_path, &dst, debug, pb)?;

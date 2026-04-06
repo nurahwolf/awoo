@@ -1,26 +1,42 @@
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// How often (in completed paths) to write a Phase 3 checkpoint.
-/// Each checkpoint only writes the `completed` set — not the hash cache —
-/// so this can be kept low without any serialisation overhead.
-pub const SAVE_INTERVAL: usize = 500;
+// ── Custom serde for [u8; 32] ─────────────────────────────────────────────
+// Stores the hash as a 64-character hex string in JSON (human-readable,
+// compatible with the existing on-disk format) but keeps it as raw bytes
+// in memory to avoid a hex-decode on every cache lookup.
+mod hash_hex {
+    use serde::{de::Error as _, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&blake3::Hash::from_bytes(*bytes).to_hex())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = <&str as serde::Deserialize>::deserialize(d)?;
+        blake3::Hash::from_hex(s)
+            .map(|h| *h.as_bytes())
+            .map_err(D::Error::custom)
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct HashCacheEntry {
     pub mtime: u64,
     pub size: u64,
-    pub hash: String, // hex-encoded BLAKE3 hash
+    /// Raw BLAKE3 digest stored as bytes; serialised as hex in JSON.
+    #[serde(with = "hash_hex")]
+    pub hash: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct ProgressState {
-    /// Relative paths (as strings) that have been successfully processed
-    pub completed: HashSet<String>,
-    /// Hash cache keyed by absolute path string
-    pub hash_cache: HashMap<String, HashCacheEntry>,
+    /// Relative paths (as strings) that have been successfully processed.
+    pub completed: AHashSet<String>,
+    /// Hash cache keyed by absolute path string.
+    pub hash_cache: AHashMap<String, HashCacheEntry>,
 }
 
 impl ProgressState {
@@ -42,7 +58,7 @@ impl ProgressState {
                 Self::default()
             }
         };
-        // Merge any Phase 3 checkpoint that was written after the last full save.
+        // Merge any Phase 3 checkpoint written after the last full save.
         Self::merge_checkpoint(path, &mut state.completed);
         state
     }
@@ -50,9 +66,8 @@ impl ProgressState {
     /// Serialise the full state (hash cache + completed set) to `path`.
     ///
     /// Called once after Phase 2 (to persist the hash cache) and once at the
-    /// very end of Phase 3 (to persist the final completed set).  This write
-    /// can be large — O(number of files × average path length) — so it must
-    /// not be called on the hot copy path.
+    /// very end of Phase 3. This write can be large, so it must not be called
+    /// on the hot copy path.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -62,8 +77,7 @@ impl ProgressState {
         }
         let content = serde_json::to_string(self).context("Failed to serialize progress state")?;
 
-        // Write to a hidden temp file then rename atomically so a crash mid-write
-        // never leaves a corrupted progress file behind.
+        // Atomic write via temp file + rename.
         let tmp = path.with_file_name(format!(
             ".{}.tmp",
             path.file_name().unwrap_or_default().to_string_lossy()
@@ -75,78 +89,65 @@ impl ProgressState {
         Ok(())
     }
 
-    /// Serialise **only** the `completed` set to a lightweight checkpoint file,
-    /// deliberately omitting the hash cache.
+    /// Merge completions from the checkpoint file into `completed`.
     ///
-    /// The hash cache does not change during Phase 3 (no new files are hashed),
-    /// so there is no need to re-serialise it on every checkpoint.  Omitting it
-    /// reduces a potential 200 MB+ JSON write down to a few hundred kilobytes,
-    /// eliminating the per-checkpoint stall that was serialising the entire
-    /// Rayon thread pool through a multi-second mutex hold.
-    ///
-    /// The checkpoint file is a sibling of `path` with a `.ckpt` extension.
-    /// `load_or_default` automatically merges it back on the next `--resume`.
-    pub fn save_completions(&self, path: &Path) -> Result<()> {
-        #[derive(serde::Serialize)]
-        struct Slim<'a> {
-            completed: &'a std::collections::HashSet<String>,
-        }
-
-        let content = serde_json::to_string(&Slim {
-            completed: &self.completed,
-        })
-        .context("Failed to serialize completions checkpoint")?;
-
-        let ckpt = ckpt_path(path);
-        let tmp = ckpt.with_file_name(format!(
-            ".{}.tmp",
-            ckpt.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        std::fs::write(&tmp, &content)
-            .with_context(|| format!("Failed to write completions checkpoint {:?}", tmp))?;
-        std::fs::rename(&tmp, &ckpt)
-            .with_context(|| format!("Failed to rename {:?} to {:?}", tmp, ckpt))?;
-        Ok(())
-    }
-
-    /// Merge any pending lightweight checkpoint back into this state and
-    /// delete the checkpoint file.  Called by `load_or_default` automatically.
-    fn merge_checkpoint(path: &Path, completed: &mut std::collections::HashSet<String>) {
-        #[derive(serde::Deserialize)]
-        struct Slim {
-            completed: std::collections::HashSet<String>,
-        }
-
+    /// Handles two formats:
+    /// - **Old JSON format** (`{"completed":[...]}`) written by older awoo builds.
+    ///   Merged and then deleted (it is a one-shot snapshot).
+    /// - **New line-delimited format** (one relative path per line) written by the
+    ///   current append-only log. Merged but NOT deleted — the file will be
+    ///   appended to during the current run and removed only after the final
+    ///   full save succeeds.
+    fn merge_checkpoint(path: &Path, completed: &mut AHashSet<String>) {
         let ckpt = ckpt_path(path);
         if !ckpt.exists() {
             return;
         }
-        let merged = std::fs::read_to_string(&ckpt)
-            .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<Slim>(&s).map_err(|e| e.to_string()));
-
-        match merged {
-            Ok(slim) => {
-                let added = slim.completed.len();
-                completed.extend(slim.completed);
-                eprintln!("  + Merged {} completions from checkpoint.", added);
-                let _ = std::fs::remove_file(&ckpt);
-            }
+        let content = match std::fs::read_to_string(&ckpt) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "⚠️  Could not read completions checkpoint: {}. Ignoring.",
-                    e
-                );
+                eprintln!("⚠️  Could not read checkpoint: {}. Ignoring.", e);
+                return;
+            }
+        };
+
+        // Try old JSON format first (backward compatibility).
+        #[derive(serde::Deserialize)]
+        struct SlimJson {
+            completed: AHashSet<String>,
+        }
+        if let Ok(slim) = serde_json::from_str::<SlimJson>(&content) {
+            let added = slim.completed.len();
+            completed.extend(slim.completed);
+            if added > 0 {
+                eprintln!("  + Merged {} completions from checkpoint.", added);
+            }
+            let _ = std::fs::remove_file(&ckpt); // JSON ckpt is a one-shot; delete it
+            return;
+        }
+
+        // New line-delimited format.
+        let before = completed.len();
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                completed.insert(line.to_string());
             }
         }
+        let added = completed.len() - before;
+        if added > 0 {
+            eprintln!("  + Merged {} completions from checkpoint.", added);
+        }
+        // Do NOT delete — will be appended to and removed after a successful
+        // final full save.
     }
 
+    /// Look up a cached hash. Returns `Some([u8; 32])` if `mtime` and `size`
+    /// both match — no hex-decode required, the bytes are copied directly.
     pub fn get_cached_hash(&self, path: &str, mtime: u64, size: u64) -> Option<[u8; 32]> {
         self.hash_cache.get(path).and_then(|entry| {
             if entry.mtime == mtime && entry.size == size {
-                blake3::Hash::from_hex(&entry.hash)
-                    .ok()
-                    .map(|h| *h.as_bytes())
+                Some(entry.hash) // Direct [u8; 32] copy — zero decode overhead
             } else {
                 None
             }
@@ -154,14 +155,8 @@ impl ProgressState {
     }
 
     pub fn insert_hash_cache(&mut self, path: String, mtime: u64, size: u64, hash: [u8; 32]) {
-        self.hash_cache.insert(
-            path,
-            HashCacheEntry {
-                mtime,
-                size,
-                hash: blake3::Hash::from_bytes(hash).to_hex().to_string(),
-            },
-        );
+        self.hash_cache
+            .insert(path, HashCacheEntry { mtime, size, hash });
     }
 }
 
