@@ -17,7 +17,7 @@ use std::time::Duration;
 use args::Args;
 use fs::{copy_file, create_subvol_or_dir, FileEntry};
 use hasher::hash_file_cached;
-use progress::{ProgressState, SAVE_INTERVAL};
+use progress::{ckpt_path, ProgressState, SAVE_INTERVAL};
 
 /// Returns a best-effort absolute path. Tries `canonicalize` first (resolves symlinks);
 /// falls back to prepending the current working directory for paths that don't exist yet.
@@ -309,7 +309,11 @@ fn main() -> Result<()> {
                 s.completed.len() % SAVE_INTERVAL == 0
             };
             if should_save {
-                if let Err(e) = state.lock().unwrap().save(&progress_file) {
+                // Use save_completions (omits the hash cache) rather than save().
+                // The hash cache does not change during Phase 3 and can be 200 MB+
+                // for large datasets; calling save() here serialised the entire
+                // Rayon thread pool through a multi-second mutex hold every 500 files.
+                if let Err(e) = state.lock().unwrap().save_completions(&progress_file) {
                     eprintln!("⚠️  Failed to save progress checkpoint: {}", e);
                 }
             }
@@ -320,10 +324,16 @@ fn main() -> Result<()> {
 
     copy_pb.finish_and_clear();
 
-    // Final save
+    // Final full save — includes both the completed set and the hash cache.
+    // Once this succeeds the lightweight .ckpt file (written during Phase 3
+    // checkpoints) is no longer needed and is removed.
     if !args.dry_run {
         if let Err(e) = state.lock().unwrap().save(&progress_file) {
             eprintln!("⚠️  Failed to save final progress: {}", e);
+        } else {
+            // Best-effort: clean up the checkpoint file now that the full
+            // state has been atomically committed to the main progress file.
+            let _ = std::fs::remove_file(ckpt_path(&progress_file));
         }
     }
 
