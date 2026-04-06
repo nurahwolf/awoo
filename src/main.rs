@@ -83,13 +83,25 @@ fn main() -> Result<()> {
         Arc::new(RwLock::new(s))
     };
 
-    // Parse & canonicalize sources
+    // Parse & canonicalise sources.
+    // Accepted formats:
+    //   Name:/path/to/dir  - assign an explicit label
+    //   /path/to/dir       - label derived from the directory basename
     let mut sources = Vec::new();
     for src in &args.sources {
-        let Some((name, path)) = src.split_once(':') else {
-            anyhow::bail!("Invalid format '{}'. Expected Name:/path/to/dir", src);
+        let (name, path_str) = match src.split_once(':') {
+            Some((n, p)) => (n.to_string(), p),
+            None => {
+                let p = std::path::Path::new(src.as_str());
+                let n = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(src.as_str())
+                    .to_string();
+                (n, src.as_str())
+            }
         };
-        sources.push((name.to_string(), std::fs::canonicalize(path)?));
+        sources.push((name, std::fs::canonicalize(path_str)?));
     }
 
     // ── Startup validation ────────────────────────────────────────

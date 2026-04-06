@@ -7,7 +7,8 @@ use std::path::PathBuf;
     about = "High-performance Btrfs merge with BLAKE3 & parallel I/O"
 )]
 pub struct Args {
-    /// Source directories in format Name:/absolute/path
+    /// Source directories. Accepts either `Name:/path/to/dir` (explicit label)
+    /// or a bare `/path/to/dir` (label derived from the directory's basename).
     #[arg(required = true)]
     pub sources: Vec<String>,
 
