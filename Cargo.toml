@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "awoo"
-version = "0.2.0"
+version = "0.0.5"
 
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }

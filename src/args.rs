@@ -4,7 +4,19 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "awoo",
-    about = "High-performance Btrfs merge with BLAKE3 & parallel I/O"
+    version,
+    about = "High-performance Btrfs merge with BLAKE3 & parallel I/O",
+    long_about = "awoo merges multiple Btrfs subvolumes into a single consolidated volume.\n\
+\n\
+Files with identical relative paths are compared by BLAKE3 hash:\n\
+  • Identical content  → copied once to Consolidated/\n\
+  • Differing content  → each version placed in Collision/<source-name>/\n\
+\n\
+Source directories are never modified. All copies use Btrfs reflinks\n\
+(FICLONE ioctl) where available, falling back to Direct I/O or a\n\
+standard copy on non-Btrfs filesystems.\n\
+\n\
+Use -h for a brief summary of flags, or --help for this full description."
 )]
 pub struct Args {
     /// Source directories. Accepts either `Name:/path/to/dir` (explicit label)
