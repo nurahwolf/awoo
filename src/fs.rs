@@ -60,7 +60,7 @@ struct DirectBuf([u8; 256 * 1024]);
 /// stored those bytes for long-term use and won't be re-reading them soon.
 /// Falls back to `std::fs::copy` (which uses `copy_file_range` on Linux) if
 /// the filesystem does not support `O_DIRECT`.
-fn copy_content(src: &Path, tmp: &Path) -> Result<()> {
+fn copy_content(src: &Path, tmp: &Path) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
         use std::io::{Read, Write};
@@ -106,14 +106,14 @@ fn copy_content(src: &Path, tmp: &Path) -> Result<()> {
                 let _ = tmp_file.set_permissions(meta.permissions());
             }
 
-            return Ok(());
+            return Ok(true); // O_DIRECT was used
         }
         // O_DIRECT not supported on this filesystem — fall through.
     }
 
     // Non-Linux or O_DIRECT unavailable: std::fs::copy handles content + permissions.
     std::fs::copy(src, tmp).with_context(|| format!("Failed to copy {:?} to {:?}", src, tmp))?;
-    Ok(())
+    Ok(false) // std::fs::copy was used
 }
 
 /// Copy all non-content metadata from `src` to `dst`: extended attributes,
@@ -155,15 +155,21 @@ fn copy_metadata(src: &Path, dst: &Path) -> Result<()> {
 /// Cross-platform wrapper: tries a Btrfs reflink (Linux) first, then an atomic
 /// Direct I/O copy, then renames into place.
 ///
+/// When `debug` is true, prints a one-line label for each file showing which
+/// copy method was actually used: `[FICLONE ]`, `[O_DIRECT]`, or `[CP      ]`.
+///
 /// - FICLONE path: already atomic and preserves all metadata natively.
 /// - Fallback path: `copy_content` (O_DIRECT read + cache eviction) followed
 ///   by `copy_metadata` (xattrs, ownership, timestamps), then an atomic rename.
 ///   A crash or disk-full mid-write leaves `dst` untouched.
-fn copy_with_reflink_fallback(src: &Path, dst: &Path) -> Result<()> {
+fn copy_with_reflink_fallback(src: &Path, dst: &Path, debug: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         // FICLONE is already atomic and preserves all metadata — nothing else needed.
         if reflink_file(src, dst).is_ok() {
+            if debug {
+                eprintln!("[FICLONE ] {}", dst.display());
+            }
             return Ok(());
         }
     }
@@ -175,18 +181,30 @@ fn copy_with_reflink_fallback(src: &Path, dst: &Path) -> Result<()> {
         dst.file_name().unwrap_or_default().to_string_lossy()
     ));
 
-    let result = (|| -> Result<()> {
-        copy_content(src, &tmp)?;
+    let method: Result<bool> = (|| -> Result<bool> {
+        let used_direct = copy_content(src, &tmp)?;
         copy_metadata(src, &tmp)?;
         std::fs::rename(&tmp, dst)
             .with_context(|| format!("Failed to rename {:?} to {:?}", &tmp, dst))?;
-        Ok(())
+        Ok(used_direct)
     })();
 
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp); // best-effort cleanup on any failure
+    match method {
+        Ok(used_direct) => {
+            if debug {
+                if used_direct {
+                    eprintln!("[O_DIRECT] {}", dst.display());
+                } else {
+                    eprintln!("[CP      ] {}", dst.display());
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // best-effort cleanup on any failure
+            Err(e)
+        }
     }
-    result
 }
 
 /// Creates `path` as a BTRFS subvolume if possible, otherwise falls back to a regular directory.
@@ -273,11 +291,16 @@ pub fn create_subvol_or_dir(path: &Path) -> Result<()> {
 /// Copy a `FileEntry` to `dst_base/entry.rel_path`, using a Btrfs reflink where possible.
 ///
 /// In dry-run mode, prints what would be copied instead of performing the operation.
-pub fn copy_file(entry: &FileEntry, dst_base: &Path, dry_run: bool) -> Result<()> {
+/// When `debug` is true, prints a one-line label showing the copy method used.
+pub fn copy_file(entry: &FileEntry, dst_base: &Path, dry_run: bool, debug: bool) -> Result<()> {
     let dst = dst_base.join(&entry.rel_path);
 
     if dry_run {
-        eprintln!("[DRY] {} -> {}", entry.abs_path.display(), dst.display());
+        eprintln!(
+            "[DRY    ] {} -> {}",
+            entry.abs_path.display(),
+            dst.display()
+        );
         return Ok(());
     }
 
@@ -286,6 +309,6 @@ pub fn copy_file(entry: &FileEntry, dst_base: &Path, dry_run: bool) -> Result<()
             .with_context(|| format!("Failed to create directory {:?}", parent))?;
     }
 
-    copy_with_reflink_fallback(&entry.abs_path, &dst)?;
+    copy_with_reflink_fallback(&entry.abs_path, &dst, debug)?;
     Ok(())
 }
