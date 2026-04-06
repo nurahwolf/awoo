@@ -476,12 +476,50 @@ fn main() -> Result<()> {
         let unique_hashes: HashSet<[u8; 32]> = entries.iter().map(|e| e.hash).collect();
 
         let success = if unique_hashes.len() == 1 {
-            copy_file(&entries[0], &args.consolidated, args.dry_run)
-                .map_err(|e| eprintln!("⚠️  Consolidate failed: {}", e))
-                .is_ok()
+            let dst = args.consolidated.join(rel_path);
+            if dst.exists() {
+                // Destination already in Consolidated — check whether it is the same content
+                match hash_file_cached(&dst, &state) {
+                    Ok(existing_hash) if existing_hash == entries[0].hash => {
+                        // Identical content already in place — nothing to do
+                        true
+                    }
+                    Ok(_) => {
+                        // Different content — conflict with an existing consolidated file;
+                        // route the incoming file(s) to Collision and leave the existing one alone
+                        eprintln!(
+                            "⚠️  Conflict: {} already exists with different content. Routing to Collision.",
+                            dst.display()
+                        );
+                        entries.iter().all(|entry| {
+                            let dst_base = args.collision.join(&entry.source_name);
+                            copy_file(entry, &dst_base, args.dry_run)
+                                .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
+                                .is_ok()
+                        })
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️  Could not hash existing consolidated file {}: {}. Skipping.",
+                            dst.display(),
+                            e
+                        );
+                        false
+                    }
+                }
+            } else {
+                copy_file(&entries[0], &args.consolidated, args.dry_run)
+                    .map_err(|e| eprintln!("⚠️  Consolidate failed: {}", e))
+                    .is_ok()
+            }
         } else {
             entries.iter().all(|entry| {
                 let dst_base = args.collision.join(&entry.source_name);
+                let collision_dst = dst_base.join(&entry.rel_path);
+                if collision_dst.exists() {
+                    // Already written to Collision in a previous run — skip
+                    return true;
+                }
                 copy_file(entry, &dst_base, args.dry_run)
                     .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                     .is_ok()
