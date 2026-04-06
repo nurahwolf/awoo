@@ -1,8 +1,11 @@
 # AWOO (Better Name Pending)
 
 The intent of this program / script is to 'merge' many subvolumes into one big homogeneous subvolume.
+
 THIS PROGRAM DOES **NOT** MODIFY THE SOURCE DATA FED INTO IT IN ANY WAY! Cleanup of those is manual, by design.
+
 It checks file hashes and if any collisions are found then they are moved to a collision folder.
+
 Files are moved to the exact same path as their source, so:
 
 ```
@@ -47,6 +50,55 @@ cargo build --release
   --dry-run
 
 # 3. Execute
+./target/release/awoo \
+  "Storage_A:/mnt/btrfs/A" \
+  "Storage_B:/mnt/btrfs/B" \
+  "Storage_C:/mnt/btrfs/C" \
+  -o ./Consolidated -c ./Collision
+```
+
+## Resume Support
+
+If a run is interrupted (power loss, Ctrl-C, full disk, etc.) you can pick up where you left off instead of starting over.
+
+A progress file is automatically written to `<consolidated>/.awoo_progress.json` (override with `--progress-file`). It stores two things:
+
+- **Completed paths** — relative paths that were fully and successfully copied this run.
+- **Hash cache** — a record of each file's `mtime`, `size`, and BLAKE3 hash so that unchanged files are never re-hashed on a subsequent run, even without `--resume`.
+
+### Resuming an interrupted run
+
+Pass `--resume` and use the exact same arguments as the original run:
+
+```shell
+./target/release/awoo \
+  "Storage_A:/mnt/btrfs/A" \
+  "Storage_B:/mnt/btrfs/B" \
+  "Storage_C:/mnt/btrfs/C" \
+  -o ./Consolidated -c ./Collision \
+  --resume
+```
+
+awoo will skip every path already recorded in the progress file and only process the remainder. A summary at the end shows how many paths were skipped.
+
+### Custom progress file location
+
+```shell
+./target/release/awoo \
+  "Storage_A:/mnt/btrfs/A" \
+  "Storage_B:/mnt/btrfs/B" \
+  "Storage_C:/mnt/btrfs/C" \
+  -o ./Consolidated -c ./Collision \
+  --progress-file /tmp/my_merge.json \
+  --resume
+```
+
+### Starting fresh (while keeping the hash cache)
+
+Omitting `--resume` starts a clean run, as in all files are re-processed, though the hash cache from previous runs is still used to skip redundant BLAKE3 I/O for unchanged files.
+
+```shell
+# No --resume: completed set is cleared, hash cache is still used for speed
 ./target/release/awoo \
   "Storage_A:/mnt/btrfs/A" \
   "Storage_B:/mnt/btrfs/B" \
