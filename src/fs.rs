@@ -10,8 +10,8 @@ pub struct FileEntry {
     pub hash: [u8; 32],
 }
 
-/// Copy file using native Btrfs FICLONE ioctl (Linux only)
-/// Falls back to std::fs::copy if reflink is not supported
+/// Copy file using native Btrfs FICLONE ioctl (Linux only).
+/// Returns an error if the ioctl fails for any reason.
 #[cfg(target_os = "linux")]
 fn reflink_file(src: &Path, dst: &Path) -> Result<()> {
     use std::fs::OpenOptions;
@@ -23,7 +23,7 @@ fn reflink_file(src: &Path, dst: &Path) -> Result<()> {
 
     let src_file = File::open(src).with_context(|| format!("Failed to open source {:?}", src))?;
 
-    // Destination must be a newly created, empty file for FICLONE to work
+    // Destination must be a newly created, empty file for FICLONE to work.
     let dst_file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -43,64 +43,141 @@ fn reflink_file(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Cross-platform wrapper: tries reflink on Linux, falls back to an atomic std::fs::copy.
+/// A 256 KB buffer with the 4096-byte alignment required by `O_DIRECT`.
 ///
-/// The fallback writes to a hidden `.awoo_tmp` file in the same directory, then
-/// copies extended attributes, ownership (uid/gid), and timestamps from the source
-/// before renaming atomically into place. This ensures a partially-written file
-/// (e.g. from disk-full or SIGKILL) is never mistaken for a valid destination on
-/// the next run, and that all metadata is faithfully preserved.
+/// `repr(C, align(4096))` guarantees the alignment. The `Box` used at the
+/// call site keeps the 256 KB off the stack; in release mode rustc allocates
+/// the value directly on the heap without a stack intermediate.
+#[cfg(target_os = "linux")]
+#[repr(C, align(4096))]
+struct DirectBuf([u8; 256 * 1024]);
+
+/// Copy file content from `src` to `tmp`, including Unix permission bits.
 ///
-/// All metadata steps are best-effort — errors are silently ignored for filesystems
-/// or permission levels that don't support them.
+/// On Linux, opens `src` with `O_DIRECT` to read without polluting the page
+/// cache, writes to `tmp` with ordinary buffered I/O, then calls
+/// `POSIX_FADV_DONTNEED` on `tmp` to evict the freshly written pages — we
+/// stored those bytes for long-term use and won't be re-reading them soon.
+/// Falls back to `std::fs::copy` (which uses `copy_file_range` on Linux) if
+/// the filesystem does not support `O_DIRECT`.
+fn copy_content(src: &Path, tmp: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let direct_src = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(src);
+
+        if let Ok(mut src_file) = direct_src {
+            let mut tmp_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(tmp)
+                .with_context(|| format!("Failed to create {:?}", tmp))?;
+
+            let mut buf = Box::new(DirectBuf([0u8; 256 * 1024]));
+            loop {
+                let n = src_file
+                    .read(&mut buf.0)
+                    .context("Failed to read source file (O_DIRECT)")?;
+                if n == 0 {
+                    break;
+                }
+                tmp_file
+                    .write_all(&buf.0[..n])
+                    .context("Failed to write destination file")?;
+            }
+
+            // Evict the destination pages — we wrote this file for long-term
+            // storage and will not read it again in this run.
+            // SAFETY: fd is valid; POSIX_FADV_DONTNEED is a well-defined constant.
+            unsafe {
+                libc::posix_fadvise(tmp_file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+
+            // Copy Unix permission bits (std::fs::copy does this automatically;
+            // our manual loop must do it explicitly).
+            if let Ok(meta) = std::fs::metadata(src) {
+                let _ = tmp_file.set_permissions(meta.permissions());
+            }
+
+            return Ok(());
+        }
+        // O_DIRECT not supported on this filesystem — fall through.
+    }
+
+    // Non-Linux or O_DIRECT unavailable: std::fs::copy handles content + permissions.
+    std::fs::copy(src, tmp).with_context(|| format!("Failed to copy {:?} to {:?}", src, tmp))?;
+    Ok(())
+}
+
+/// Copy all non-content metadata from `src` to `dst`: extended attributes,
+/// ownership (uid/gid), and timestamps.
+///
+/// All steps are best-effort — errors are silently ignored for filesystems or
+/// permission levels that do not support a given feature.
+fn copy_metadata(src: &Path, dst: &Path) -> Result<()> {
+    // Extended attributes — covers user xattrs, POSIX ACLs, SELinux labels, etc.
+    #[cfg(unix)]
+    if let Ok(names) = xattr::list(src) {
+        for name in names {
+            if let Ok(Some(value)) = xattr::get(src, &name) {
+                let _ = xattr::set(dst, &name, &value);
+            }
+        }
+    }
+
+    // Ownership (uid/gid) — best-effort; requires CAP_CHOWN or root.
+    // Must come before timestamps: chown resets atime on some kernels.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(src) {
+            let _ = std::os::unix::fs::chown(dst, Some(meta.uid()), Some(meta.gid()));
+        }
+    }
+
+    // Timestamps — last, so chown above cannot reset them.
+    if let Ok(meta) = std::fs::metadata(src) {
+        let atime = filetime::FileTime::from_last_access_time(&meta);
+        let mtime = filetime::FileTime::from_last_modification_time(&meta);
+        let _ = filetime::set_file_times(dst, atime, mtime);
+    }
+
+    Ok(())
+}
+
+/// Cross-platform wrapper: tries a Btrfs reflink (Linux) first, then an atomic
+/// Direct I/O copy, then renames into place.
+///
+/// - FICLONE path: already atomic and preserves all metadata natively.
+/// - Fallback path: `copy_content` (O_DIRECT read + cache eviction) followed
+///   by `copy_metadata` (xattrs, ownership, timestamps), then an atomic rename.
+///   A crash or disk-full mid-write leaves `dst` untouched.
 fn copy_with_reflink_fallback(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        // FICLONE is already atomic and preserves all metadata — no temp file needed.
+        // FICLONE is already atomic and preserves all metadata — nothing else needed.
         if reflink_file(src, dst).is_ok() {
             return Ok(());
         }
-        // Fall through to the atomic copy below if reflink is unsupported.
     }
 
-    // Write to a hidden temp file in the same directory so the rename is always
-    // on the same filesystem (POSIX rename is atomic within one filesystem).
+    // Write to a hidden temp file in the same directory so the rename is guaranteed
+    // to be on the same filesystem (POSIX rename is atomic within one filesystem).
     let tmp = dst.with_file_name(format!(
         ".{}.awoo_tmp",
         dst.file_name().unwrap_or_default().to_string_lossy()
     ));
 
     let result = (|| -> Result<()> {
-        std::fs::copy(src, &tmp)
-            .with_context(|| format!("Failed to copy {:?} to {:?}", src, &tmp))?;
-
-        // Preserve extended attributes — covers user xattrs, POSIX ACLs, SELinux
-        // labels, and any other xattr namespace supported by the filesystem.
-        #[cfg(unix)]
-        if let Ok(names) = xattr::list(src) {
-            for name in names {
-                if let Ok(Some(value)) = xattr::get(src, &name) {
-                    let _ = xattr::set(&tmp, &name, &value);
-                }
-            }
-        }
-
-        // Preserve ownership (uid/gid) — best-effort; requires CAP_CHOWN or root.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(meta) = std::fs::metadata(src) {
-                let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
-            }
-        }
-
-        // Preserve timestamps — must come after chown, as chown can reset atime.
-        if let Ok(meta) = std::fs::metadata(src) {
-            let atime = filetime::FileTime::from_last_access_time(&meta);
-            let mtime = filetime::FileTime::from_last_modification_time(&meta);
-            let _ = filetime::set_file_times(&tmp, atime, mtime);
-        }
-
+        copy_content(src, &tmp)?;
+        copy_metadata(src, &tmp)?;
         std::fs::rename(&tmp, dst)
             .with_context(|| format!("Failed to rename {:?} to {:?}", &tmp, dst))?;
         Ok(())
@@ -193,7 +270,9 @@ pub fn create_subvol_or_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy file using Btrfs reflink if available (native ioctl), with fallback
+/// Copy a `FileEntry` to `dst_base/entry.rel_path`, using a Btrfs reflink where possible.
+///
+/// In dry-run mode, prints what would be copied instead of performing the operation.
 pub fn copy_file(entry: &FileEntry, dst_base: &Path, dry_run: bool) -> Result<()> {
     let dst = dst_base.join(&entry.rel_path);
 
@@ -207,8 +286,6 @@ pub fn copy_file(entry: &FileEntry, dst_base: &Path, dry_run: bool) -> Result<()
             .with_context(|| format!("Failed to create directory {:?}", parent))?;
     }
 
-    // Use native reflink with fallback to regular copy
     copy_with_reflink_fallback(&entry.abs_path, &dst)?;
-
     Ok(())
 }
