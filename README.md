@@ -57,6 +57,9 @@ cargo build --release
   -o ./Consolidated -c ./Collision
 ```
 
+## Limiting I/O
+Hashing speed will be limited by your I/O capability, in particular read throughput. Run during off-peak hours might be smart, or use §ionice -c 2 -n 7 ./target/release/awoo ...` to limit IO priority.
+
 ## Resume Support
 
 If a run is interrupted (power loss, Ctrl-C, full disk, etc.) you can pick up where you left off instead of starting over.
