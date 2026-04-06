@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target/
+
+# PROJECT SPECIFIC: Progress/cache files generated at runtime
+*.awoo_progress.json
+
+# macOS because fscking apple BS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux (I hate FUSE in particular)
+*~
+.fuse_hidden*
+.Trash-*
+
+# Windows (Also needs to be nuked from orbit)
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor & IDE (Ok these are fine...)
+.vscode/
+.idea/
+*.swp
+*.swo
+*.kate-swp
+
+# PERSONAL: Juuuuuuust in case...
+
+.snapshots
+.snapshots/*
