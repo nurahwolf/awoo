@@ -171,6 +171,87 @@ fn copy_with_reflink_fallback(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Creates `path` as a BTRFS subvolume if possible, otherwise falls back to a regular directory.
+/// Does nothing if `path` already exists.
+#[cfg(target_os = "linux")]
+fn create_subvol_or_dir(path: &Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    if path.exists() {
+        return Ok(());
+    }
+
+    // Ensure the parent directory exists before we can create anything inside it
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create parent directory {:?}", parent))?;
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Path {:?} has no file name component", path))?;
+    let name_lossy = name.to_string_lossy();
+    let name_bytes = name_lossy.as_bytes();
+    if name_bytes.len() > 4087 {
+        anyhow::bail!("Name too long for BTRFS subvolume: {:?}", name);
+    }
+
+    // Open the parent directory to obtain a file descriptor for the ioctl
+    let parent_file = File::open(parent)
+        .with_context(|| format!("Failed to open parent directory {:?}", parent))?;
+
+    // BTRFS_IOC_SUBVOL_CREATE = _IOW(0x94, 14, struct btrfs_ioctl_vol_args)
+    // struct btrfs_ioctl_vol_args = { __s64 fd; char name[4088]; } = 4096 bytes
+    // _IOW(type, nr, size) = (IOC_WRITE=1 << 30) | (type << 8) | nr | (size << 16)
+    //                      = 0x40000000 | 0x9400 | 0x0E | 0x10000000 = 0x5000_940E
+    const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940E;
+
+    #[repr(C)]
+    struct BtrfsIoctlVolArgs {
+        fd: i64,
+        name: [u8; 4088],
+    }
+
+    let mut vol_args = BtrfsIoctlVolArgs {
+        fd: 0,
+        name: [0u8; 4088],
+    };
+    vol_args.name[..name_bytes.len()].copy_from_slice(name_bytes);
+
+    // SAFETY: BTRFS_IOC_SUBVOL_CREATE reads vol_args from userspace to create a subvolume
+    // named `name` inside the directory referenced by the fd. The kernel validates both the
+    // fd and the name, returning ENOTTY or EINVAL if the filesystem is not Btrfs.
+    let ret = unsafe {
+        libc::ioctl(
+            parent_file.as_raw_fd(),
+            BTRFS_IOC_SUBVOL_CREATE,
+            &mut vol_args as *mut BtrfsIoctlVolArgs,
+        )
+    };
+
+    if ret == 0 {
+        eprintln!("  🌿 Created BTRFS subvolume: {}", path.display());
+        return Ok(());
+    }
+
+    // ioctl failed (not a Btrfs volume, or unsupported kernel) — fall back to a plain directory
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("Failed to create directory {:?}", path))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_subvol_or_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("Failed to create directory {:?}", path))?;
+    Ok(())
+}
+
 /// Hash a file using BLAKE3 with a 256KB read buffer
 fn hash_file(path: &Path) -> Result<[u8; 32]> {
     let mut file = File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
@@ -281,8 +362,8 @@ fn main() -> Result<()> {
     }
 
     if !args.dry_run {
-        std::fs::create_dir_all(&args.consolidated).context("Failed to create consolidated dir")?;
-        std::fs::create_dir_all(&args.collision).context("Failed to create collision dir")?;
+        create_subvol_or_dir(&args.consolidated).context("Failed to create consolidated dir")?;
+        create_subvol_or_dir(&args.collision).context("Failed to create collision dir")?;
     }
 
     // ─────────────────────────────────────────────────────────────
