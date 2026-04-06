@@ -31,7 +31,7 @@ Collision:
    - Hello/Hi
 ```
 
-I would recommend running the awesome (Best-Effort Extent-Same)[https://github.com/Zygo/bees] project first, to deduplicate file blocks.
+I would recommend running the awesome [Best-Effort Extent-Same](https://github.com/Zygo/bees) project first, to deduplicate file blocks.
 Once you are done and any collisions manually dealt with, you can then delete the original subvolumes.
 
 While this project is *designed* to work with BTRFS subvolumes, it is coded in a way that it should be usable with any linux filesystem.
@@ -58,7 +58,7 @@ cargo build --release
 ```
 
 ## Limiting I/O
-Hashing speed will be limited by your I/O capability, in particular read throughput. Run during off-peak hours might be smart, or use §ionice -c 2 -n 7 ./target/release/awoo ...` to limit IO priority.
+Hashing speed will be limited by your I/O capability, in particular read throughput. Run during off-peak hours might be smart, or use `ionice -c 2 -n 7 ./target/release/awoo ...` to limit IO priority.
 
 ## Resume Support
 
