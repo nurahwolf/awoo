@@ -43,12 +43,21 @@ fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Configure the Rayon thread pool before any parallel work begins.
-    // Over-subscribing (e.g. --threads 2× CPU count) keeps storage saturated
-    // while some threads are waiting on I/O.
-    if let Some(n) = args.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
+    // Always configure the Rayon thread pool explicitly so we can set the
+    // worker-thread stack size.
+    // In particular, `blake3::Hasher::update_rayon` splits large
+    // files via recursive rayon::join calls that all execute on the *same*
+    // worker-thread stack; the default 8 MB stack overflows for files in the
+    // gigabyte range `(recursion depth ≈ log₂(file_size / chunk_threshold))`.
+    // 32 MB gives comfortable headroom for any realistic file size.
+    // If you are on a memory constrainted system... Well, it sucks to be you.
+    // Sorry.
+    {
+        let mut builder = rayon::ThreadPoolBuilder::new().stack_size(32 * 1024 * 1024);
+        if let Some(n) = args.threads {
+            builder = builder.num_threads(n);
+        }
+        builder
             .build_global()
             .context("Failed to configure Rayon thread pool")?;
     }
