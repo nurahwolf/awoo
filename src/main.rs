@@ -18,6 +18,26 @@ use fs::{copy_file, create_subvol_or_dir, FileEntry};
 use hasher::hash_file_cached;
 use progress::{ProgressState, SAVE_INTERVAL};
 
+/// Returns a best-effort absolute path. Tries `canonicalize` first (resolves symlinks);
+/// falls back to prepending the current working directory for paths that don't exist yet.
+fn resolve_path(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
+}
+
+/// Returns true if either path is a prefix of the other (i.e. one contains the other).
+/// Uses `Path::starts_with` which compares whole components, not raw string prefixes.
+fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -60,6 +80,47 @@ fn main() -> Result<()> {
         sources.push((name.to_string(), std::fs::canonicalize(path)?));
     }
 
+    // ── Startup validation ────────────────────────────────────────
+    // 1. Duplicate source names — collision files are bucketed by name,
+    //    so two sources sharing a name would silently overwrite each other.
+    {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (name, _) in &sources {
+            if !seen.insert(name.as_str()) {
+                anyhow::bail!(
+                    "Duplicate source name '{name}'. Each source must have a unique label."
+                );
+            }
+        }
+    }
+
+    // 2. Source / output overlap — scanning a path that contains (or is contained
+    //    by) an output directory corrupts the run.
+    {
+        let cons_abs = resolve_path(&args.consolidated);
+        let coll_abs = resolve_path(&args.collision);
+
+        if paths_overlap(&cons_abs, &coll_abs) {
+            anyhow::bail!(
+                "Consolidated ({cons_abs:?}) and Collision ({coll_abs:?}) directories overlap."
+            );
+        }
+
+        for (name, src) in &sources {
+            if paths_overlap(src, &cons_abs) {
+                anyhow::bail!(
+                    "Source '{name}' ({src:?}) overlaps with the Consolidated output directory ({cons_abs:?})."
+                );
+            }
+            if paths_overlap(src, &coll_abs) {
+                anyhow::bail!(
+                    "Source '{name}' ({src:?}) overlaps with the Collision output directory ({coll_abs:?})."
+                );
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────
+
     if !args.dry_run {
         create_subvol_or_dir(&args.consolidated).context("Failed to create consolidated dir")?;
         create_subvol_or_dir(&args.collision).context("Failed to create collision dir")?;
@@ -84,7 +145,12 @@ fn main() -> Result<()> {
                 .into_iter()
                 .filter_map(move |entry| {
                     let entry = entry.ok()?;
-                    if !entry.file_type().is_file() {
+                    let ft = entry.file_type();
+                    if ft.is_symlink() {
+                        eprintln!("⚠️  Skipping symlink: {}", entry.path().display());
+                        return None;
+                    }
+                    if !ft.is_file() {
                         return None;
                     }
                     let rel = entry.path().strip_prefix(&src_clone).unwrap().to_path_buf();

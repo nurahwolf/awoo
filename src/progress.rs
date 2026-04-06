@@ -45,8 +45,17 @@ impl ProgressState {
             }
         }
         let content = serde_json::to_string(self).context("Failed to serialize progress state")?;
-        std::fs::write(path, content)
-            .with_context(|| format!("Failed to write progress file {:?}", path))?;
+
+        // Write to a hidden temp file then rename atomically so a crash mid-write
+        // never leaves a corrupted progress file behind.
+        let tmp = path.with_file_name(format!(
+            ".{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::write(&tmp, &content)
+            .with_context(|| format!("Failed to write temp progress file {:?}", tmp))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("Failed to rename {:?} to {:?}", tmp, path))?;
         Ok(())
     }
 

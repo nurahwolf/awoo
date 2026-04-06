@@ -43,21 +43,49 @@ fn reflink_file(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Cross-platform wrapper: tries reflink on Linux, falls back to std::fs::copy
+/// Cross-platform wrapper: tries reflink on Linux, falls back to an atomic std::fs::copy.
+///
+/// The fallback writes to a hidden `.awoo_tmp` file in the same directory, preserves
+/// the source's timestamps, then renames atomically into place. This ensures a
+/// partially-written file (e.g. from disk-full or SIGKILL) is never mistaken for a
+/// valid destination on the next run.
 fn copy_with_reflink_fallback(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        // Try native reflink first
+        // FICLONE is already atomic and preserves all metadata — no temp file needed.
         if reflink_file(src, dst).is_ok() {
             return Ok(());
         }
-        // If reflink fails (e.g., not on Btrfs, or filesystem doesn't support it),
-        // fall through to regular copy below
+        // Fall through to the atomic copy below if reflink is unsupported.
     }
 
-    // Fallback: standard copy (no reflink)
-    std::fs::copy(src, dst).with_context(|| format!("Failed to copy {:?} to {:?}", src, dst))?;
-    Ok(())
+    // Write to a hidden temp file in the same directory so the rename is always
+    // on the same filesystem (POSIX rename is atomic within one filesystem).
+    let tmp = dst.with_file_name(format!(
+        ".{}.awoo_tmp",
+        dst.file_name().unwrap_or_default().to_string_lossy()
+    ));
+
+    let result = (|| -> Result<()> {
+        std::fs::copy(src, &tmp)
+            .with_context(|| format!("Failed to copy {:?} to {:?}", src, &tmp))?;
+
+        // Preserve source timestamps (best-effort — ignore errors on unsupported fs).
+        if let Ok(meta) = std::fs::metadata(src) {
+            let atime = filetime::FileTime::from_last_access_time(&meta);
+            let mtime = filetime::FileTime::from_last_modification_time(&meta);
+            let _ = filetime::set_file_times(&tmp, atime, mtime);
+        }
+
+        std::fs::rename(&tmp, dst)
+            .with_context(|| format!("Failed to rename {:?} to {:?}", &tmp, dst))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp); // best-effort cleanup on any failure
+    }
+    result
 }
 
 /// Creates `path` as a BTRFS subvolume if possible, otherwise falls back to a regular directory.

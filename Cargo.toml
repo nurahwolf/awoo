@@ -7,6 +7,7 @@ version = "0.2.0"
 anyhow = "1"
 blake3 = "1.5"
 clap = { version = "4", features = ["derive"] }
+filetime = "0.2"
 indicatif = "0.17"
 jwalk = "0.8"
 libc = "0.2"
