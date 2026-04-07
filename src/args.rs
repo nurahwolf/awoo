@@ -98,14 +98,18 @@ Use -h for a brief summary of flags, or --help for this full description."
 pub struct Args {
     // ==================== Required Arguments ====================
     /// Source directories to merge.
-    /// 
+    ///
     /// Format: `Name:/path/to/dir` (explicit label) or `/path/to/dir` (auto-label).
     /// Multiple sources can be specified. Each source must have a unique name.
-    /// 
+    ///
     /// Examples:
     ///   - `backup:/mnt/backup` - labels this source as "backup"
     ///   - `/home/user/data`    - automatically labeled as "data"
-    #[arg(required = true, value_name = "SOURCE", help_heading = "Required Arguments")]
+    #[arg(
+        required = true,
+        value_name = "SOURCE",
+        help_heading = "Required Arguments"
+    )]
     pub sources: Vec<String>,
 
     // ==================== Output Configuration ====================
@@ -232,7 +236,7 @@ impl Args {
     }
 
     /// Validate the parsed arguments after parsing.
-    /// 
+    ///
     /// This performs runtime validation that cannot be done by clap:
     /// - Source directories exist and are accessible
     /// - Output directories don't overlap with sources
@@ -322,6 +326,7 @@ pub fn paths_overlap(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile;
 
     #[test]
     fn test_source_spec_parse_bare_path() {
@@ -329,7 +334,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let spec = format!("{}", temp_dir.path().display());
         let source = SourceSpec::parse(&spec).unwrap();
-        
+
         assert_eq!(source.path, temp_dir.path().canonicalize().unwrap());
         // Name should be derived from the directory basename
         assert!(!source.name.is_empty());
@@ -340,7 +345,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let spec = format!("mylabel:{}", temp_dir.path().display());
         let source = SourceSpec::parse(&spec).unwrap();
-        
+
         assert_eq!(source.name, "mylabel");
         assert_eq!(source.path, temp_dir.path().canonicalize().unwrap());
     }
@@ -349,7 +354,10 @@ mod tests {
     fn test_source_spec_invalid_name_chars() {
         let result = SourceSpec::parse("bad/name:/tmp");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid characters"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid characters"));
     }
 
     #[test]
