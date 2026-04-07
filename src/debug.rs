@@ -67,7 +67,7 @@ pub fn print_debug_info(args: &Args, sources: &[(String, PathBuf)], progress_fil
     #[cfg(target_os = "linux")]
     let (reflink_ok, odirect_ok): (Option<bool>, Option<bool>) = {
         // Skip the reflink write-probe in dry-run when the output dir doesn't exist yet.
-        let r = if args.dry_run && !args.consolidated.exists() {
+        let r = if args.dry_run && !args.output.exists() {
             None
         } else {
             probe_reflink(&probe_dir)
