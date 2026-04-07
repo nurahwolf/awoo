@@ -6,7 +6,6 @@ mod progress;
 
 use ahash::AHashMap;
 use anyhow::{Context, Result};
-use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::{Parallelism, WalkDir};
 use rayon::prelude::*;
@@ -15,33 +14,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use args::Args;
+use args::{Args, SourceSpec};
 use fs::{copy_file, create_subvol_or_dir, FileEntry};
 use hasher::hash_file_cached;
 use progress::{ckpt_path, ProgressState};
 
-/// Returns a best-effort absolute path. Tries `canonicalize` first (resolves symlinks);
-/// falls back to prepending the current working directory for paths that don't exist yet.
-fn resolve_path(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(path)
-        }
-    })
-}
-
-/// Returns true if either path is a prefix of the other (i.e. one contains the other).
-/// Uses `Path::starts_with` which compares whole components, not raw string prefixes.
-fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
-    a.starts_with(b) || b.starts_with(a)
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Validate arguments and parse sources
+    let sources: Vec<SourceSpec> = args.validate()?;
 
     // Always configure the Rayon thread pool explicitly so we can set the
     // worker-thread stack size.
@@ -74,16 +56,20 @@ fn main() -> Result<()> {
         let mut s = ProgressState::load_or_default(&progress_file);
         if args.resume {
             if has_file {
-                eprintln!(
-                    "🔄 Resuming: {} previously completed paths, {} cached hashes.\n",
-                    s.completed.len(),
-                    s.hash_cache.len()
-                );
+                if !args.is_quiet() {
+                    eprintln!(
+                        "🔄 Resuming: {} previously completed paths, {} cached hashes.\n",
+                        s.completed.len(),
+                        s.hash_cache.len()
+                    );
+                }
             } else {
-                eprintln!(
-                    "⚠️  --resume specified but no progress file found at {:?}. Starting fresh.\n",
-                    progress_file
-                );
+                if !args.is_quiet() {
+                    eprintln!(
+                        "⚠️  --resume specified but no progress file found at {:?}. Starting fresh.\n",
+                        progress_file
+                    );
+                }
             }
         } else {
             // Fresh run: keep hash cache for speed but reset completion records
@@ -92,71 +78,18 @@ fn main() -> Result<()> {
         Arc::new(RwLock::new(s))
     };
 
-    // Parse & canonicalise sources.
-    // Accepted formats:
-    //   Name:/path/to/dir  - assign an explicit label
-    //   /path/to/dir       - label derived from the directory basename
-    let mut sources = Vec::new();
-    for src in &args.sources {
-        let (name, path_str) = match src.split_once(':') {
-            Some((n, p)) => (n.to_string(), p),
-            None => {
-                let p = std::path::Path::new(src.as_str());
-                let n = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(src.as_str())
-                    .to_string();
-                (n, src.as_str())
-            }
-        };
-        sources.push((name, std::fs::canonicalize(path_str)?));
-    }
-
-    // ── Startup validation ────────────────────────────────────────
-    // 1. Duplicate source names
-    {
-        let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
-        for (name, _) in &sources {
-            if !seen.insert(name.as_str()) {
-                anyhow::bail!(
-                    "Duplicate source name '{name}'. Each source must have a unique label."
-                );
-            }
-        }
-    }
-    // 2. Source / output overlap
-    {
-        let cons_abs = resolve_path(&args.consolidated);
-        let coll_abs = resolve_path(&args.collision);
-
-        if paths_overlap(&cons_abs, &coll_abs) {
-            anyhow::bail!(
-                "Consolidated ({cons_abs:?}) and Collision ({coll_abs:?}) directories overlap."
-            );
-        }
-        for (name, src) in &sources {
-            if paths_overlap(src, &cons_abs) {
-                anyhow::bail!(
-                    "Source '{name}' ({src:?}) overlaps with the Consolidated output directory ({cons_abs:?})."
-                );
-            }
-            if paths_overlap(src, &coll_abs) {
-                anyhow::bail!(
-                    "Source '{name}' ({src:?}) overlaps with the Collision output directory ({coll_abs:?})."
-                );
-            }
-        }
-    }
-    // ─────────────────────────────────────────────────────────────
-
     if !args.dry_run {
         create_subvol_or_dir(&args.consolidated).context("Failed to create consolidated dir")?;
         create_subvol_or_dir(&args.collision).context("Failed to create collision dir")?;
     }
 
     if args.debug {
-        debug::print_debug_info(&args, &sources, &progress_file);
+        // Convert SourceSpec to the format expected by debug module
+        let debug_sources: Vec<(String, PathBuf)> = sources
+            .iter()
+            .map(|s| (s.name.clone(), s.path.clone()))
+            .collect();
+        debug::print_debug_info(&args, &debug_sources, &progress_file);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -173,9 +106,9 @@ fn main() -> Result<()> {
     // all_paths, FileEntry, and the db HashMap key (no PathBuf clone per entry).
     let all_paths: Vec<(Arc<str>, PathBuf, Arc<PathBuf>)> = sources
         .iter()
-        .flat_map(|(name, src)| {
-            let name_arc: Arc<str> = Arc::from(name.as_str());
-            let src_clone = src.clone();
+        .flat_map(|source| {
+            let name_arc: Arc<str> = Arc::from(source.name.as_str());
+            let src_clone = source.path.clone();
             WalkDir::new(&src_clone)
                 .parallelism(Parallelism::RayonDefaultPool {
                     busy_timeout: Duration::new(5, 0),
@@ -185,7 +118,9 @@ fn main() -> Result<()> {
                     let entry = entry.ok()?;
                     let ft = entry.file_type();
                     if ft.is_symlink() {
-                        eprintln!("⚠️  Skipping symlink: {}", entry.path().display());
+                        if !args.is_quiet() {
+                            eprintln!("⚠️  Skipping symlink: {}", entry.path().display());
+                        }
                         return None;
                     }
                     if !ft.is_file() {
@@ -199,11 +134,13 @@ fn main() -> Result<()> {
         .collect();
 
     scan_pb.finish_and_clear();
-    eprintln!(
-        "📊 Found {} files across {} sources.\n",
-        all_paths.len(),
-        sources.len()
-    );
+    if !args.is_quiet() {
+        eprintln!(
+            "📊 Found {} files across {} sources.\n",
+            all_paths.len(),
+            sources.len()
+        );
+    }
 
     // ─────────────────────────────────────────────────────────────
     // Phase 2: Parallel Hashing (with cache + resume skip)
