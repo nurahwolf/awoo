@@ -104,6 +104,7 @@ fn main() -> Result<()> {
     // rather than a heap allocation, saving ~1 alloc per file per source.
     // Use Arc<PathBuf> for rel paths so the same allocation is shared between
     // all_paths, FileEntry, and the db HashMap key (no PathBuf clone per entry).
+    let is_quiet = args.is_quiet();
     let all_paths: Vec<(Arc<str>, PathBuf, Arc<PathBuf>)> = sources
         .iter()
         .flat_map(|source| {
@@ -118,7 +119,7 @@ fn main() -> Result<()> {
                     let entry = entry.ok()?;
                     let ft = entry.file_type();
                     if ft.is_symlink() {
-                        if !args.is_quiet() {
+                        if !is_quiet {
                             eprintln!("⚠️  Skipping symlink: {}", entry.path().display());
                         }
                         return None;
