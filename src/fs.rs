@@ -7,6 +7,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::args::Args;
+
 /// A file discovered during the scan phase and ready to be hashed / copied.
 ///
 /// `source_name` and `rel_path` are wrapped in `Arc` so that the same
@@ -313,16 +315,10 @@ pub fn create_subvol_or_dir(path: &Path) -> Result<()> {
 /// Parent directory creation is short-circuited via a thread-local cache of
 /// directories already created by this Rayon worker, avoiding redundant
 /// `stat` syscalls for files that share a parent.
-pub fn copy_file(
-    entry: &FileEntry,
-    dst_base: &Path,
-    dry_run: bool,
-    debug: bool,
-    pb: &ProgressBar,
-) -> Result<()> {
+pub fn copy_file(entry: &FileEntry, dst_base: &Path, args: &Args, pb: &ProgressBar) -> Result<()> {
     let dst = dst_base.join(entry.rel_path.as_ref());
 
-    if dry_run {
+    if args.dry_run && args.is_verbose() {
         pb.println(format!(
             "[DRY    ] {} -> {}",
             entry.abs_path.display(),
@@ -340,6 +336,6 @@ pub fn copy_file(
         }
     }
 
-    copy_with_reflink_fallback(&entry.abs_path, &dst, debug, pb)?;
+    copy_with_reflink_fallback(&entry.abs_path, &dst, args.is_verbose(), pb)?;
     Ok(())
 }

@@ -28,7 +28,7 @@ pub fn print_debug_info(args: &Args, sources: &[(String, PathBuf)], progress_fil
     eprintln!("  Dry-run:       {}", args.dry_run);
     eprintln!("  Resume:        {}", args.resume);
     eprintln!("  Progress file: {}", progress_file.display());
-    eprintln!("  Consolidated:  {}", args.consolidated.display());
+    eprintln!("  Consolidated:  {}", args.output.display());
     eprintln!("  Collision:     {}", args.collision.display());
     eprintln!("  Sources ({}):", sources.len());
     for (name, path) in sources {
@@ -43,12 +43,8 @@ pub fn print_debug_info(args: &Args, sources: &[(String, PathBuf)], progress_fil
             eprintln!("  {name:<18} →  {}", fs_type(path));
         }
     }
-    if args.consolidated.exists() {
-        eprintln!(
-            "  {:<18} →  {}",
-            "Consolidated",
-            fs_type(&args.consolidated)
-        );
+    if args.output.exists() {
+        eprintln!("  {:<18} →  {}", "Consolidated", fs_type(&args.output));
     }
     if args.collision.exists() {
         eprintln!("  {:<18} →  {}", "Collision", fs_type(&args.collision));
@@ -56,8 +52,8 @@ pub fn print_debug_info(args: &Args, sources: &[(String, PathBuf)], progress_fil
 
     // ── I/O Capability Probes ────────────────────────────────────────────
     // Probe on the destination filesystem where possible; fall back to CWD.
-    let probe_dir: PathBuf = if args.consolidated.exists() {
-        args.consolidated.clone()
+    let probe_dir: PathBuf = if args.output.exists() {
+        args.output.clone()
     } else {
         PathBuf::from(".")
     };

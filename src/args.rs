@@ -121,7 +121,7 @@ pub struct Args {
         default_value_os_t = std::env::current_dir().unwrap_or_else(|_| ".".into()).join("Consolidated"),
         help_heading = "Output Configuration"
     )]
-    pub consolidated: PathBuf,
+    pub output: PathBuf,
 
     /// Output directory for conflicting files (same path, different content)
     #[arg(
@@ -207,32 +207,14 @@ impl Args {
         Parser::parse()
     }
 
-    /// Parse command-line arguments with explicit handling of quiet flag.
-    pub fn parse_from<I>(itr: I) -> Self
-    where
-        I: IntoIterator,
-        I::Item: Into<std::ffi::OsString> + Clone,
-    {
-        Parser::parse_from(itr)
-    }
-
-    /// Returns the effective verbosity level, considering the --quiet flag.
-    pub fn verbosity(&self) -> Verbosity {
-        if self.quiet {
-            Verbosity::Quiet
-        } else {
-            self.verbosity
-        }
-    }
-
     /// Check if verbose output is enabled.
     pub fn is_verbose(&self) -> bool {
-        matches!(self.verbosity(), Verbosity::Verbose)
+        matches!(self.verbosity, Verbosity::Verbose)
     }
 
     /// Check if quiet mode is enabled.
     pub fn is_quiet(&self) -> bool {
-        matches!(self.verbosity(), Verbosity::Quiet)
+        matches!(self.verbosity, Verbosity::Quiet)
     }
 
     /// Validate the parsed arguments after parsing.
@@ -264,7 +246,7 @@ impl Args {
         }
 
         // Resolve output paths for overlap checking
-        let cons_abs = resolve_path(&self.consolidated);
+        let cons_abs = resolve_path(&self.output);
         let coll_abs = resolve_path(&self.collision);
 
         // Check if consolidated and collision directories overlap
@@ -326,7 +308,6 @@ pub fn paths_overlap(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile;
 
     #[test]
     fn test_source_spec_parse_bare_path() {

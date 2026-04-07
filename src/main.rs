@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     let progress_file = args
         .progress_file
         .clone()
-        .unwrap_or_else(|| args.consolidated.join(".awoo_progress.json"));
+        .unwrap_or_else(|| args.output.join(".awoo_progress.json"));
 
     // Load progress state (hash cache always; completed set only when resuming)
     let state = {
@@ -79,11 +79,11 @@ fn main() -> Result<()> {
     };
 
     if !args.dry_run {
-        create_subvol_or_dir(&args.consolidated).context("Failed to create consolidated dir")?;
+        create_subvol_or_dir(&args.output).context("Failed to create consolidated dir")?;
         create_subvol_or_dir(&args.collision).context("Failed to create collision dir")?;
     }
 
-    if args.debug {
+    if args.is_verbose() {
         // Convert SourceSpec to the format expected by debug module
         let debug_sources: Vec<(String, PathBuf)> = sources
             .iter()
@@ -247,13 +247,13 @@ fn main() -> Result<()> {
         let all_same = entries.iter().all(|e| e.hash == first_hash);
 
         let success = if all_same {
-            let dst = args.consolidated.join(rel_path.as_ref());
+            let dst = args.output.join(rel_path.as_ref());
             if dst.exists() {
                 // Destination already in Consolidated — check content.
                 match hash_file_cached(&dst, &state) {
                     Ok(existing_hash) if existing_hash == first_hash => {
                         // Identical content already in place — nothing to do.
-                        if args.debug {
+                        if args.is_verbose() {
                             copy_pb.println(format!(
                                 "[SKIP    ] {} (identical content already in Consolidated)",
                                 rel_path.display()
@@ -263,13 +263,15 @@ fn main() -> Result<()> {
                     }
                     Ok(_) => {
                         // Different content — conflict; route to Collision.
-                        eprintln!(
-                            "⚠️  Conflict: {} already exists with different content. Routing to Collision.",
-                            dst.display()
-                        );
+                        if !args.is_quiet() {
+                            eprintln!(
+                                "⚠️  Conflict: {} already exists with different content. Routing to Collision.",
+                                dst.display()
+                            );
+                        }
                         entries.iter().all(|entry| {
                             let dst_base = args.collision.join(entry.source_name.as_ref());
-                            copy_file(entry, &dst_base, args.dry_run, args.debug, &copy_pb)
+                            copy_file(entry, &dst_base, &args, &copy_pb)
                                 .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                                 .is_ok()
                         })
@@ -284,7 +286,7 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                copy_file(&entries[0], &args.consolidated, args.dry_run, args.debug, &copy_pb)
+                copy_file(&entries[0], &args.output, &args, &copy_pb)
                     .map_err(|e| eprintln!("⚠️  Consolidate failed: {}", e))
                     .is_ok()
             }
@@ -293,7 +295,7 @@ fn main() -> Result<()> {
                 let dst_base = args.collision.join(entry.source_name.as_ref());
                 let collision_dst = dst_base.join(entry.rel_path.as_ref());
                 if collision_dst.exists() {
-                    if args.debug {
+                    if args.is_verbose() {
                         copy_pb.println(format!(
                             "[SKIP    ] {} (already in Collision)",
                             collision_dst.display()
@@ -302,7 +304,7 @@ fn main() -> Result<()> {
                     return true;
                 }
 
-                copy_file(entry, &dst_base, args.dry_run, args.debug, &copy_pb)
+                copy_file(entry, &dst_base, &args, &copy_pb)
                     .map_err(|e| eprintln!("⚠️  Collision copy failed: {}", e))
                     .is_ok()
             })
@@ -315,7 +317,7 @@ fn main() -> Result<()> {
         }
 
         let outcome = if all_same {
-            let dst = args.consolidated.join(rel_path.as_ref());
+            let dst = args.output.join(rel_path.as_ref());
             if dst.exists() {
                 match hash_file_cached(&dst, &state) {
                     Ok(existing_hash) if existing_hash == first_hash => Outcome::Consolidated,
