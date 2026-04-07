@@ -1,6 +1,17 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project will be documented in this file. Where applicable, AI contributions will be marked [AI ASSISTED].
+
+## [0.0.7] - Parser Improvements
+
+## Added
+- [[CHANGELOG.md]] is now actually referenced in the release notes now. Yay!
+- [AI ASSISTED] There are now (basic) unit tests for the argument parser... That has not been tested yet.
+
+## Changed
+- [AI ASSISTED] `--quiet` and `--verbose` now are mapped to an enum for easier handling and to allow for future expansion.
+- [AI ASSISTED] Better validation of parsed arguments, including code refactor for maintainability.
+- The output of `consolidated` has changed to `output`, and thus output flag is now `--output`.
 
 ## [0.0.5] - Performance Optimisations
 
