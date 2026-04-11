@@ -114,6 +114,7 @@ fn main() -> Result<()> {
                 .parallelism(Parallelism::RayonDefaultPool {
                     busy_timeout: Duration::new(5, 0),
                 })
+                .skip_hidden(false)
                 .into_iter()
                 .filter_map(move |entry| {
                     let entry = entry.ok()?;
